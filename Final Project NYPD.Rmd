@@ -1,0 +1,234 @@
+---
+title: "NYPD Shooting Incident Data Report"
+author: "E. Turner"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+As someone who does not live in New York City but might visit on vacation, I decided use shooting data to analyze the times of year when there are fewer shootings, the times of day when there are fewer shootings, and the boroughs with the least shootings per capita and per acre.  I am also interested in whether shootings are trending up or down over time.
+
+### Packages
+
+In addition to the tidyverse package, this project uses the openxlsx and lubridate packages.
+
+```{r packages_used, message = FALSE}
+library(lubridate)
+library(tidyverse)
+library(openxlsx)
+```
+
+
+### Data
+
+This project was created using shooting data from the website https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD. 
+
+```{r import_nypd, message = FALSE}
+# Importing the NYC Shooting data
+nypd_data <- read_csv ("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD")
+```
+
+This historic data includes shooting incidents from `r min(nypd_data$OCCUR_DATE) ` to `r max(nypd_data$OCCUR_DATE)`.  
+For population and acreage information, I am using the 2020 Census data for NYC found at [https://s-media.nyc.gov](https://s-media.nyc.gov/agencies/dcp/assets/files/excel/data-tools/census/census2020/nyc-decennialcensusdata_2010_2020_census-blocks.xlsx).  This data takes quite a while to load because of the file size.
+
+```{r import_population_data, message = FALSE}
+# Importing Census data using the openxlsx package
+census_data <- read.xlsx("https://s-media.nyc.gov/agencies/dcp/assets/files/excel/data-tools/census/census2020/nyc-decennialcensusdata_2010_2020_census-blocks.xlsx",sheet=1)
+
+# Changing format to a tibble
+census_data <- as_tibble (census_data)
+```
+
+
+### Tidying and Transforming
+
+One of the first steps I will take as part of this analysis is removing location data and information regarding perpetrators.  Analyzing patterns in perpetrators is popular, but data exists, perforce, only for perpetrators who have been caught and even then only if they are correctly identified. 
+
+A PDF available at https://data.cityofnewyork.us/api/views/5ucz-vwe8/files/ec9fa5b4-2cfa-4af0-af44-594b85ace55b?download=true&filename=NYPD_Shootings_Incident_Level_Data_Footnotes.pdf explains, among other things, that STATISTICAL_MURDER_FLAG is true if the shooting resulted in the victim's death.  Additionally, the footnotes state that shooting incidents that were not able to be geo-coded (for example, due to an invalid address) have been located as occurring at the police station house within the precinct of occurrence, that shooting incidents occurring in open areas such as parks or beaches may be geo-coded as occurring on streets or intersections bordering the area, and that shooting incidents occurring on a moving train on transit systems are geo-coded as occurring at the train’s next stop. I do not have the background to work around these limitations. 
+
+
+```{r initial_tidy_nypd}
+# separating date and time information using the lubridate package
+nypd_data$year <- year(mdy(nypd_data$OCCUR_DATE))
+nypd_data$month <- month(mdy(nypd_data$OCCUR_DATE))
+nypd_data$hours <- hour(hms(nypd_data$OCCUR_TIME))
+nypd_data$minutes <- minute(hms(nypd_data$OCCUR_TIME))
+
+# Selecting columns I will keep for my analysis
+nypd_data <- nypd_data %>%
+  select(INCIDENT_KEY, 
+         BORO, 
+         year, 
+         month,
+         hours,
+         minutes,
+         STATISTICAL_MURDER_FLAG)   
+
+# names into snake case
+names(nypd_data) <- tolower(names(nypd_data))
+
+# Calculating the number of years of data
+years <- max(nypd_data$year) - min(nypd_data$year) + 1
+```
+
+From the census data, I am only going to keep information regarding the population and acreage of each borough.  Unfortunately, the census uses different age groups and different ethnic and racial groups than the NYPD shooting data. The age group data can be adjusted for, but the racial data cannot. 
+
+```{r initial_tidy_census}
+# Borough Population and Size
+borough_data <- census_data %>%
+  filter(GeogType == "Boro2020") %>%
+  select("GeogName", Pop1, LandAcres) %>%
+# Calculating population density per acre
+  mutate(density = Pop1/LandAcres) %>%
+  rename(boro = `GeogName`, pop = `Pop1`, acres = `LandAcres`) %>%
+  mutate_if (is.character, str_to_upper)
+```
+
+## Analysis
+
+We are now ready to explore times of year, times of day and locations which have fewer shootings.  The data includes whether each shooting was fatal, and fatalities could be analyzed instead of total shootings.  However, we see in the graph below that fatal shootings are a relatively consistent proportion of shootings, so future analysis will be restricted to the total numbers of shootings.  
+
+```{r compare_probability_fatal}
+# Calculate percent fatal by year
+is_fatal <- nypd_data %>%
+  group_by(year) %>%
+  summarize (prob_fatal = mean(statistical_murder_flag, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(data = is_fatal) +
+  geom_bar(mapping = aes(x = year, weight = prob_fatal)) +
+  geom_smooth(mapping = aes(x = year, y = prob_fatal), method = 'lm', formula = y ~ x)+
+  labs(x = "Year", y = "Percent of shootings that are fatal")
+```
+
+### Year to year comparison  
+
+First we are going to analyze annual shootings in NYC over time.
+
+```{r annual_shootings_by_borough}
+# Calculating annual shootings by borough
+annual_shootings <- nypd_data %>%
+  group_by(boro, year) %>%
+  summarize (annual = n()) 
+
+ggplot(data = annual_shootings) +
+  geom_bar(mapping = aes(x = year, weight = annual, fill = boro))+
+  labs(x = "Year", y = "Shootings", fill = "Borough")
+```
+From this graph, we see that shootings were generally decreasing from 2005 to 2019, but shot up again during and after the COVID-19 pandemic.  Hopefully the downward trend we see post 2021 will continue and shootings will decrease to or below pre-pandemic levels.
+
+### Month to month comparison
+
+Our next question is whether there are times of the year when shootings are less frequent. This data will be calculated in total shootings per million residents.
+
+```{r compare_boroughs_by_month}
+# per million monthly shootings by borough
+monthly_per_million <- nypd_data %>%
+  group_by(boro, month) %>%
+  summarize (average_month = n()/years) %>%
+  left_join(borough_data, by=c("boro")) %>%
+  mutate(per_million = average_month/pop * 1000000)
+
+ggplot(data = monthly_per_million ) +
+  geom_point(mapping = aes(x = month, y = per_million, color = boro)) +
+  geom_line (mapping = aes(x = month, y = per_million, color = boro)) +
+  labs(x = "Month", y = "Shootings per million residents", color = "Borough")
+
+```
+
+The increase during summer months could be a function of temperature, or of tourism, or public schools not being in session, and is beyond the scope of this analysis.  Also, I am curious what factors play into higher per capita shootings in Bronx and Brooklyn.  With the data that I have, the only analysis I can check is population density.  However, the population density in Manhattan is `r borough_data$density[3]` while the densities in the Bronx and Brooklyn boroughs are `r borough_data$density[1]` and `r borough_data$density[2]` respectively, so population density does not seem to be a stong determining factor.
+
+### Hourly Shootings
+
+Now we consider whether there are hours of the day when shootings are less likely to occur. First we will look at average shootings by hour in July, which is one of the months with the most shootings.   
+
+```{r compare_times_july}
+# per capita monthly shootings by borough
+hourly_july <- nypd_data %>%
+  filter(month == 07) %>%
+  group_by(boro, hours) %>%
+  summarize (average_hourly = n()/years)
+
+ggplot(data = hourly_july) +
+  geom_point(mapping = aes(x = hours, y = average_hourly, color = boro)) +
+  geom_line (mapping = aes(x = hours, y = average_hourly, color = boro)) +
+  labs(x = "Time (24 hour clock)", 
+       y = "Average shootings per hour", 
+       color = "Borough", 
+       title = "July Averages"
+       )
+```
+During July, it looks like shootings are least frequent between 6am and noon.  Similar trends occur year round.
+```{r facet_each month}
+hourly <- nypd_data %>%
+  group_by(boro, month, hours) %>%
+  summarize(average_hourly = n()/years)
+
+ggplot(data = hourly) +
+  facet_wrap(vars(month)) +
+  geom_point(mapping = aes(x = hours, y = average_hourly, color = boro)) +
+  geom_line (mapping = aes(x = hours, y = average_hourly, color = boro)) +
+  labs(x = "Time (24 hour clock)", y = "Average shootings", color = "Borough")
+```
+
+
+### One last analysis
+
+We saw that in 2020, shootings increased significantly.  I want to graph shootings per month in 2020 as opposed to shootings per month pre 2020 to see if the month-to-month distribution changed.
+
+```{r compare_average_to_2020_by_month}
+# Calculate average monthly shootings pre-Covid
+monthly_pre_covid <- nypd_data %>%
+  filter(year <= 2019) %>%
+  group_by(month) %>%
+  # This data covers 14 years of data
+  summarize (averages_pre_covid = n()/14)
+
+monthly_2019 <- nypd_data %>%
+  filter(year == 2019) %>%
+  group_by(month) %>%
+  summarize (by_month_2019 = n())
+
+combined_monthly <- nypd_data %>%
+  filter(year == 2020) %>%
+  group_by(month) %>%
+  summarize (by_month_2020 = n()) %>%
+  left_join(monthly_2019, by=c("month")) %>%
+  left_join(monthly_pre_covid, by=c("month")) 
+
+ggplot(data = combined_monthly) +
+  geom_line (mapping = aes(x = month, y = averages_pre_covid), color = 'red') +
+  geom_line (mapping = aes(x = month, y = by_month_2019), color = 'blue') +
+  geom_line (mapping = aes(x = month, y = by_month_2020), color = 'green') +
+  expand_limits(y = 0) +
+  geom_text (data = subset(combined_monthly, month == 12), 
+             mapping = aes(x = month, y = averages_pre_covid), 
+             label = "Pre-Covid Average"
+             ) +
+  geom_text (data = subset(combined_monthly, month == 12), 
+             mapping = aes(x = month, y = by_month_2019), 
+             label = "2019"
+             ) +
+  geom_text (data = subset(combined_monthly, month == 12), 
+             mapping = aes(x = month, y = by_month_2020), 
+             label = "2020"
+             ) +
+  labs (x = "Month", y = "Shootings")
+```
+
+Because the tourism and school schedules were disrupted, I expected to not see as distinct an increase in the summer as we saw in previous visualizations, but shootings in the summer of 2020 were almost double the average shooting prior to 2020 and significantly higher than the preceding year.
+
+
+## Conclusion   
+
+From this analysis, we see that shootings are more frequent in the summer but less frequent during the morning (6am to noon) and that shootings per capita vary across the boroughs.  Biasin this analysis can exist in Census data being inaccurate, in using a single population through all years of the data, and because I chose to group the data by borough.  Additionally, the NYPD data could have been collected inaccurately or entered inaccurately.  Groupings by month and hour were arbitrary.  Maybe grouping by half hours or by weeks would have shown different patterns.
+
+
+
